@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # silence TF INFO/WARN
+
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt, hilbert
+import mne
+from PyEMD import EMD
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras import layers, models
+import matplotlib.pyplot as plt
+import sys
+
+# ----------------------------------------
+# Constants
+# ----------------------------------------
+FILE_PATH    = '/home3/s3901734/Documents/Thesis/EP1.01.txt'
+TARGET_LENGTH= 256
+SFREQ        = 128
+F_BANDS      = [(0.5, 4), (4, 8), (8, 12), (12, 16), (16, 24), (24, 40)]
+N_IMFS       = 10
+N_CLASSES    = 10
+
+# ----------------------------------------
+# 1) Load + parse raw file
+# ----------------------------------------
+import time
+import numpy as np
+import pandas as pd
+
+def load_mbd_epoc_data(path):
+    print("  → starting CSV read…", flush=True)
+    t0 = time.time()
+
+    df = pd.read_csv(
+        path,
+        sep='\t',
+        header=None,
+        comment='#',
+        usecols=[0, 3, 4, 6],                    # id, channel, code, signal
+        names=['id','channel','code','signal'],
+        dtype={'id': np.int64, 'code': np.int64},# only id & code as ints
+        engine='c',
+        low_memory=False
+    )
+    print(f"  → CSV read in {time.time()-t0:.1f}s; {len(df):,} rows", flush=True)
+
+    df = df[df['code'] >= 0]
+    print(f"  → filtered to {len(df):,} valid rows", flush=True)
+
+    print("  → parsing signal text → arrays…", flush=True)
+    t1 = time.time()
+    df['parsed'] = (
+        df['signal']
+          .str
+          .split(',')
+          .apply(lambda xs: np.array(xs, float))
+    )
+    print(f"  → parsed in {time.time()-t1:.1f}s", flush=True)
+
+    return df
+
+
+# ----------------------------------------
+# 2) Build MNE Raw per trial
+# ----------------------------------------
+def create_raws_and_labels(df):
+    raws, labels = [], []
+    for (tid, label), grp in df.groupby(['id','code']):
+        grp = grp.sort_values('channel')
+        data = np.stack(grp['parsed'].values)
+        # pad or trim
+        if data.shape[1] < TARGET_LENGTH:
+            pad = TARGET_LENGTH - data.shape[1]
+            data = np.pad(data, ((0,0),(0,pad)), mode='constant')
+        else:
+            data = data[:, :TARGET_LENGTH]
+        info = mne.create_info(
+            ch_names=[f'Ch{i}' for i in range(data.shape[0])],
+            sfreq=SFREQ, ch_types='eeg'
+        )
+        raws.append(mne.io.RawArray(data, info, verbose=False))
+        labels.append(label)
+    return raws, np.array(labels)
+
+# ----------------------------------------
+# 3) Filter + EMD + HHT per trial
+# ----------------------------------------
+def apply_bandpass(raw, low, high):
+    return raw.copy().filter(
+        l_freq=low, h_freq=high,
+        method='iir',
+        iir_params=dict(order=5, ftype='butter'),
+        verbose=False
+    ).get_data()
+
+def extract_imfs(signal):
+    emd = EMD()
+    imfs = emd(signal)
+    if imfs.shape[0] < N_IMFS:
+        pad = np.zeros((N_IMFS - imfs.shape[0], signal.shape[0]))
+        imfs = np.vstack([imfs, pad])
+    else:
+        imfs = imfs[:N_IMFS]
+    return imfs
+
+def hht_features(imfs):
+    feats = []
+    for imf in imfs:
+        analytic = hilbert(imf)
+        IA = np.abs(analytic)
+        IP = np.angle(analytic)
+        IF = np.diff(IP, prepend=IP[0])
+        feats.extend([IA, IP, IF])
+    return np.stack(feats)  # (n_imfs*3, n_times)
+
+# ----------------------------------------
+# 4) Prepare dataset (serial)
+# ----------------------------------------
+def prepare_dataset(raws, labels):
+    X, y = [], []
+    for raw, lbl in zip(raws, labels):
+        trial_feats = []
+        for low, high in F_BANDS:
+            band_data = apply_bandpass(raw, low, high)  # (n_ch, 256)
+            for ch_sig in band_data:
+                imfs = extract_imfs(ch_sig)
+                fh   = hht_features(imfs)  # (n_imfs*3, 256)
+                trial_feats.append(fh)
+        arr = np.vstack(trial_feats).T  # (256, total_feats)
+        X.append(arr)
+        y.append(lbl)
+    X = np.stack(X)
+    y = to_categorical(y, N_CLASSES)
+    return train_test_split(X, y, test_size=0.3, random_state=42)
+
+# ----------------------------------------
+# 5) Build CNN
+# ----------------------------------------
+def build_brain_digi_cnn(input_shape):
+    m = models.Sequential([
+        layers.Conv1D(256,7,activation='relu',input_shape=input_shape),
+        layers.BatchNormalization(), layers.MaxPooling1D(2),
+        layers.Conv1D(128,7,activation='relu'),
+        layers.BatchNormalization(), layers.MaxPooling1D(2),
+        layers.Conv1D(64,7,activation='relu'),
+        layers.BatchNormalization(), layers.MaxPooling1D(2),
+        layers.Conv1D(32,7,activation='relu'),
+        layers.BatchNormalization(), layers.MaxPooling1D(2),
+        layers.Flatten(),
+        layers.Dense(128,activation='relu'),
+        layers.Dense(64,activation='relu'),
+        layers.Dense(N_CLASSES,activation='softmax'),
+    ])
+    m.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    return m
+
+# ----------------------------------------
+# 6) Plot metrics
+# ----------------------------------------
+def plot_metrics(history):
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(12,4))
+    plt.subplot(1,2,1)
+    plt.plot(history.history['accuracy'], label='Train Acc')
+    plt.plot(history.history['val_accuracy'], label='Val Acc')
+    plt.title('Accuracy'); plt.legend()
+    plt.subplot(1,2,2)
+    plt.plot(history.history['loss'], label='Train Loss')
+    plt.plot(history.history['val_loss'], label='Val Loss')
+    plt.title('Loss'); plt.legend()
+    plt.show()
+
+# ----------------------------------------
+# Main
+# ----------------------------------------
+if __name__ == "__main__":
+    print("1) Loading data…", flush=True)
+    df = load_mbd_epoc_data(FILE_PATH)
+    print(f"   → done loading: {len(df)} rows over {df['id'].nunique()} trials\n", flush=True)
+
+    print("2) Creating raw epochs...", flush=True)
+    raws, labels = create_raws_and_labels(df)
+    print(f"   → {len(raws)} trials", flush=True)
+
+    print("3) Preparing dataset (serial)...", flush=True)
+    X_train, X_test, y_train, y_test = prepare_dataset(raws, labels)
+    print(f"   → X_train: {X_train.shape}, X_test: {X_test.shape}", flush=True)
+
+    print("4) Building & training model...", flush=True)
+    model = build_brain_digi_cnn((X_train.shape[1], X_train.shape[2]))
+    history = model.fit(
+        X_train, y_train,
+        epochs=10, batch_size=32,
+        validation_data=(X_test, y_test),
+        verbose=2
+    )
+
+    print("5) Plotting metrics...", flush=True)
+    plot_metrics(history)
+
+    print("6) Confusion matrix...", flush=True)
+    y_pred = model.predict(X_test)
+    cm = confusion_matrix(np.argmax(y_test,1), np.argmax(y_pred,1))
+    disp = ConfusionMatrixDisplay(cm)
+    disp.plot(cmap='Blues')
+    plt.show()
